@@ -1,11 +1,12 @@
 import os
 import datetime
+import pytz
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
+
 from googleapiclient.discovery import build
 from dotenv import load_dotenv
-import pytz
-from google.auth.transport.requests import Request
 
 # Load environment variables from .env
 load_dotenv()
@@ -17,9 +18,6 @@ SCOPES = ['https://www.googleapis.com/auth/calendar.readonly']
 CLIENT_SECRET_FILE = os.getenv('CLIENT_SECRET_FILE')
 TOKEN_FILE = os.getenv('TOKEN_FILE')
 SERVICE_ACCOUNT_FILE = os.getenv('GOOGLE_CREDENTIALS_FILE')
-
-# Define CST timezone
-CST = pytz.timezone('America/Chicago')
 
 def authenticate():
     """Authenticate the user with OAuth token or service account credentials."""
@@ -40,89 +38,88 @@ def authenticate():
         creds = service_account.Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
     return creds
 
-def format_datetime(dt):
-    """Convert datetime object to a more readable format in CST."""
-    dt_cst = dt.astimezone(CST)  # Convert to CST
-    return dt_cst.strftime("%Y-%m-%d %I:%M %p")
-
-def parse_datetime(dt_str, timezone):
-    """Convert ISO datetime to a timezone-aware datetime object."""
+def format_datetime(dt_str):
+    """Convert ISO datetime to CST for readability."""
     dt = datetime.datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
-    if dt.tzinfo is None:
-        dt = timezone.localize(dt)  # Localize naive datetime to the calendar's timezone
-    return dt.astimezone(CST)  # Convert to CST
+    utc_dt = dt.replace(tzinfo=datetime.timezone.utc)
+    cst_dt = utc_dt.astimezone(pytz.timezone("America/Chicago"))  # Convert to CST
+    return cst_dt.strftime("%Y-%m-%d %I:%M %p %Z")
 
-def merge_intervals(intervals):
-    """Merge overlapping intervals."""
-    if not intervals:
-        return []
-    intervals.sort()
-    merged = [intervals[0]]
-    for current in intervals[1:]:
-        last = merged[-1]
-        if current[0] <= last[1]:  # Overlapping intervals
-            merged[-1] = (last[0], max(last[1], current[1]))
-        else:
-            merged.append(current)
-    return merged
-
-def get_availability(days=5):
-    """List the user's availability across all calendars and aggregate for overall free time."""
+def print_all_day_events():
+    """Print details of all-day events across all calendars."""
     creds = authenticate()
     service = build('calendar', 'v3', credentials=creds)
     
-    now = datetime.datetime.now(datetime.timezone.utc)
-    end_time = now + datetime.timedelta(days=days)
-    availability = "Available times across all calendars:\n"
-
-    busy_intervals = []
-
-    # List all calendars and collect busy intervals
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    end_of_day = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=5)).isoformat()
+    print("All-Day Events Across All Calendars:\n")
+    
+    # List all calendars
     calendar_list = service.calendarList().list().execute()
     for calendar in calendar_list.get('items', []):
         calendar_id = calendar['id']
+        print(f"Calendar: {calendar.get('summary')}")
         
-        # Get the calendar's timezone
-        calendar_timezone = pytz.timezone(calendar.get('timeZone', 'UTC'))
-
+        # Fetch events for each calendar
         events_result = service.events().list(
-            calendarId=calendar_id, timeMin=now.isoformat(), timeMax=end_time.isoformat(),
+            calendarId=calendar_id, timeMin=now, timeMax=end_of_day,
             singleEvents=True, orderBy='startTime'
         ).execute()
         events = events_result.get('items', [])
+        
+        # Print all-day events
+        for event in events:
+            if 'date' in event['start']:  # Identifies all-day events
+                start = event['start'].get('date')
+                end = event['end'].get('date')
+                summary = event.get('summary', 'No title')
+                print(f"Event: {summary}")
+                print(f"Start: {start}")
+                print(f"End: {end}\n")
 
+def get_availability(days=5):
+    """List the user's availability across all calendars for the specified number of days, excluding all-day events."""
+    creds = authenticate()
+    service = build('calendar', 'v3', credentials=creds)
+    
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    end_of_day = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=days)).isoformat()
+    availability = "Available times across all calendars:\n"
+    
+    # List all calendars
+    calendar_list = service.calendarList().list().execute()
+    for calendar in calendar_list.get('items', []):
+        calendar_id = calendar['id']
+        availability += f"\nCalendar: {calendar.get('summary')}\n"
+        
+        # Fetch events for each calendar
+        events_result = service.events().list(
+            calendarId=calendar_id, timeMin=now, timeMax=end_of_day,
+            singleEvents=True, orderBy='startTime'
+        ).execute()
+        events = events_result.get('items', [])
+        
+        # Extract available time slots for each calendar, excluding all-day events
         if not events:
-            availability += f"\nCalendar: {calendar.get('summary')}\nAll day available.\n"
+            availability += "All day available.\n"
         else:
-            availability += f"\nCalendar: {calendar.get('summary')}\n"
+            last_end = now
             for event in events:
-                start = parse_datetime(event['start'].get('dateTime', event['start'].get('date')), calendar_timezone)
-                end = parse_datetime(event['end'].get('dateTime', event['end'].get('date')), calendar_timezone)
-                busy_intervals.append((start, end))
-                availability += f"Busy: {format_datetime(start)} - {format_datetime(end)}\n"
+                # Skip all-day events
+                if 'date' in event['start']:
+                    continue
+                
+                # Process regular events
+                start = event['start'].get('dateTime')
+                end = event['end'].get('dateTime')
+                if start > last_end:
+                    availability += f"Available: {format_datetime(last_end)} - {format_datetime(start)}\n"
+                last_end = end
+            availability += f"Available: {format_datetime(last_end)} - End of day\n"
 
-    # Merge all busy intervals
-    merged_busy_intervals = merge_intervals(busy_intervals)
-
-    # Calculate free times based on merged busy intervals
-    free_times = []
-    current = now.astimezone(CST)
-    for start, end in merged_busy_intervals:
-        if current < start:
-            free_times.append((current, start))
-        current = max(current, end)
-    if current < end_time.astimezone(CST):
-        free_times.append((current, end_time.astimezone(CST)))
-
-    # Display overall availability
-    availability += "\nOverall Available Times:\n"
-    if not free_times:
-        availability += "No available times.\n"
-    else:
-        for start, end in free_times:
-            availability += f"Available: {format_datetime(start)} - {format_datetime(end)}\n"
-
+    # Output formatted availability
     print(availability)
 
 if __name__ == '__main__':
+    print_all_day_events()
     get_availability()
